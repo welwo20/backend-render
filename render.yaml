@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: voz-urbana-js
+    env: node
+    buildCommand: "npm install"
+    startCommand: "npm start"

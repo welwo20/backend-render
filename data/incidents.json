@@ -1,0 +1,20 @@
+[
+  {
+    "id": "exemplo-1",
+    "dataHora": "2026-04-23T12:00:00.000Z",
+    "categoria": "Falta de Iluminação",
+    "descricao": "Poste apagado próximo à praça.",
+    "bairro": "Centro",
+    "latitude": -21.1986,
+    "longitude": -41.8904
+  },
+  {
+    "id": "exemplo-2",
+    "dataHora": "2026-04-23T12:05:00.000Z",
+    "categoria": "Descarte de Lixo",
+    "descricao": "Acúmulo de lixo na calçada.",
+    "bairro": "Cidade Nova",
+    "latitude": -21.2021,
+    "longitude": -41.8848
+  }
+]
