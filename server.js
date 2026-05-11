@@ -50,9 +50,51 @@ app.get('/api/incidentes', async (req, res) => {
 
 // Captura GPS -> Converte em Endereço -> Salva na Planilha
 app.post('/api/incidentes', async (req, res) => {
-  const { lat, lng, categoria, descricao } = req.body;
+  const {
+    lat,
+    lng,
+    categoria,
+    descricao,
+    modoLocalizacao,
+    cidadeConfirmada,
+    bairroConfirmado,
+    logradouroConfirmado
+  } = req.body;
 
   try {
+    if (modoLocalizacao === 'manual') {
+      const cidade = cidadeConfirmada || 'ITAPERUNA';
+      const bairro = bairroConfirmado || 'Centro/Geral';
+      const logradouro = logradouroConfirmado || 'Logradouro nao informado';
+      const endereco = `${logradouro}, ${bairro}, ${cidade}`;
+
+      await doc.loadInfo();
+      const sheet = doc.sheetsByIndex[0];
+
+      const dataHoraBr = new Date().toLocaleString("pt-BR", {
+        timeZone: "America/Sao_Paulo"
+      });
+
+      await sheet.addRow({
+        DataHora: dataHoraBr.toLocaleString('pt-BR'),
+        Categoria: categoria,
+        Descricao: descricao || "",
+        Latitude: "",
+        Longitude: "",
+        Endereco: endereco,
+        Bairro: bairro,
+        Status: 'Pendente'
+      });
+
+      console.log(`Relato manual salvo: ${categoria} em ${bairro}`);
+
+      return res.status(201).json({
+        sucesso: true,
+        mensagem: "Incidente reportado com sucesso!",
+        bairro: bairro
+      });
+    }
+
     // Geocodificação Reversa (Transforma coord. em endereço)
     const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`;
     const response = await axios.get(url, {
