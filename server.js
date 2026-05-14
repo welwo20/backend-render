@@ -6,220 +6,132 @@ const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 
 const app = express();
-
-//cors para permitir o HTML (porta 5500 ou live server) 
-// acessar o Node (porta 3000) sem ser bloqueado pelo navegador.
 app.use(cors()); 
 app.use(express.json());
 
-app.get('/', (req, res) => {
-  res.send('Backend Voz Urbana online');
-});
-
-// Configuração de Autenticação do Google
 const auth = new JWT({
   email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-  key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'), // Corrige as quebras de linha
+  key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
   scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 });
 
 const doc = new GoogleSpreadsheet(process.env.GOOGLE_SHEET_ID, auth);
 
-//--------------BUSCAR DADOS----------------
-app.get('/api/incidentes', async (req, res) => {
+// ==========================================
+// 1. ROTA PARA REGISTRAR/APOIAR INCIDENTES
+// ==========================================
+app.post('/api/incidentes', async (req, res) => {
+  const { lat, lng, categoria, descricao, rua, logradouro, bairro, bairroConfirmado } = req.body;
+  const userIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
   try {
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`;
+    const response = await axios.get(url, { headers: { 'User-Agent': 'VozUrbana-App' } });
+    
+    const addr = response.data && response.data.address ? response.data.address : {};
+    
+    // Prioriza o que o GPS achou, senão usa o que o frontend enviou
+    const finalRua = addr.road || rua || logradouro || "Rua não identificada";
+    const finalBairro = addr.suburb || addr.neighbourhood || bairro || bairroConfirmado || "Centro";
+    const cidade = addr.city || addr.town || "Itaperuna";
+
+    const idAgrupador = `${categoria}_${finalRua}_${finalBairro}`.toLowerCase().replace(/\s+/g, '-');
+
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
     const rows = await sheet.getRows();
-    
-    const incidentes = rows.map(row => ({
-      latitude: parseFloat(row.get('Latitude')),
-      longitude: parseFloat(row.get('Longitude')),
-      categoria: row.get('Categoria'),
-      descricao: row.get('Descricao'),
-      dataHora: row.get('DataHora')
-    }));
-    
-    res.json(incidentes);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ erro: "Erro ao buscar dados geográficos." });
-  }
-});
 
+    // Verifica se este IP já interagiu com este ID específico
+    const jaVotou = rows.find(r => 
+      r.get('ID_Agrupador') === idAgrupador && 
+      String(r.get('IPs_Apoiadores') || "").includes(userIP)
+    );
 
-// Captura GPS -> Converte em Endereço -> Salva na Planilha
-app.post('/api/incidentes', async (req, res) => {
-  const {
-    lat,
-    lng,
-    categoria,
-    descricao,
-    modoLocalizacao,
-    cidadeConfirmada,
-    bairroConfirmado,
-    logradouroConfirmado
-  } = req.body;
+    if (jaVotou) return res.status(409).json({ erro: "Você já relatou ou apoiou este problema aqui." });
 
-  try {
-    if (modoLocalizacao === 'manual') {
-      const cidade = cidadeConfirmada || 'ITAPERUNA';
-      const bairro = bairroConfirmado || 'Centro/Geral';
-      const logradouro = logradouroConfirmado || 'Logradouro nao informado';
-      const endereco = `${logradouro}, ${bairro}, ${cidade}`;
+    const incidenteAtivo = rows.find(r => 
+      r.get('ID_Agrupador') === idAgrupador && r.get('Status') !== 'Resolvido'
+    );
 
-      await doc.loadInfo();
-      const sheet = doc.sheetsByIndex[0];
-
-      const dataHoraBr = new Date().toLocaleString("pt-BR", {
-        timeZone: "America/Sao_Paulo"
-      });
-
-      await sheet.addRow({
-        DataHora: dataHoraBr.toLocaleString('pt-BR'),
-        Categoria: categoria,
-        Descricao: descricao || "",
-        Latitude: "",
-        Longitude: "",
-        Endereco: endereco,
-        Bairro: bairro,
-        Status: 'Pendente'
-      });
-
-      console.log(`Relato manual salvo: ${categoria} em ${bairro}`);
-
-      return res.status(201).json({
-        sucesso: true,
-        mensagem: "Incidente reportado com sucesso!",
-        bairro: bairro
-      });
+    if (incidenteAtivo) {
+      incidenteAtivo.set('Apoios', parseInt(incidenteAtivo.get('Apoios') || 1) + 1);
+      const ips = incidenteAtivo.get('IPs_Apoiadores') || "";
+      incidenteAtivo.set('IPs_Apoiadores', ips ? `${ips}, ${userIP}` : userIP);
+      await incidenteAtivo.save();
+      return res.status(200).json({ sucesso: true, mensagem: "Apoio registrado!", bairro: finalBairro });
     }
 
-    // Geocodificação Reversa (Transforma coord. em endereço)
-    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`;
-    const response = await axios.get(url, {
-      headers: { 'User-Agent': 'VozUrbana-App' }
-    });
-
-    const endereco = response.data.display_name || "Endereço não encontrado";
-    // Tenta pegar o bairro de diferentes campos que o Nominatim pode retornar
-    const bairro = response.data.address.suburb || 
-                   response.data.address.neighbourhood || 
-                   response.data.address.city_district || 
-                   "Centro/Geral";
-
-    // Preparação para a Planilha
-    await doc.loadInfo();
-    const sheet = doc.sheetsByIndex[0];
-
-    // FORÇA O FUSO HORÁRIO DE BRASÍLIA
-const dataHoraBr = new Date().toLocaleString("pt-BR", {
-  timeZone: "America/Sao_Paulo"
-});
-
-    // Salvamento Único
     await sheet.addRow({
-      DataHora: dataHoraBr.toLocaleString('pt-BR'),
+      DataHora: new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" }),
+      ID_Agrupador: idAgrupador,
       Categoria: categoria,
       Descricao: descricao || "",
-      // Converte para vírgula apenas no salvamento para a planilha aceitar
+      Rua: finalRua,
+      Bairro: finalBairro,
+      Cidade: cidade,
+      Endereco: response.data.display_name || "Endereço manual",
+      Apoios: 1,
+      Status: 'Pendente',
+      IPs_Apoiadores: userIP,
       Latitude: String(lat).replace('.', ','),
-      Longitude: String(lng).replace('.', ','),
-      Endereco: endereco,
-      Bairro: bairro,
-      Status: 'Pendente'
+      Longitude: String(lng).replace('.', ',')
     });
 
-    console.log(`✅ Relato salvo: ${categoria} em ${bairro}`);
-    
-    // Retorna o bairro para o frontend mostrar no alerta
-    res.status(201).json({ 
-      sucesso: true, 
-      mensagem: "Incidente reportado com sucesso!",
-      bairro: bairro 
-    });
+    res.status(201).json({ sucesso: true, mensagem: "Relato enviado!", bairro: finalBairro });
 
   } catch (error) {
-    console.error("❌ Erro no processo de reporte:", error.message);
-    res.status(500).json({ erro: "Falha ao gravar os dados georeferenciados." });
+    console.error("❌ Erro no Servidor:", error.message);
+    res.status(500).json({ erro: "Falha ao processar reporte georeferenciado." });
   }
 });
 
-//---------- Estatísticas para os cards do frontend---------
+//---------- 2. Estatísticas ---------
 app.get('/api/estatisticas', async (req, res) => {
   try {
-    // Carrega os dados da planilha
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
     const rows = await sheet.getRows();
 
-    // Cálculo dos Problemas Reportados (Total de linhas)
     const total = rows.length;
+    const resolvidos = rows.filter(r => String(r.get('Status')).toLowerCase() === 'resolvido').length;
     
-    // Cálculo de Bairros Ativos (Coluna 'Endereco')
-    const bairrosUnicos = new Set(rows.map(r => {
-      const endereco = r.get('Endereco');
-      if (endereco && endereco.includes(',')) {
-        return endereco.split(',')[1].trim(); // Pega a parte após a vírgula (Bairro)
-      }
-      return null;
-    }).filter(b => b !== null)).size;
+    const bairrosUnicos = new Set(rows.map(r => r.get('Bairro')).filter(b => b)).size;
 
-   const resolvidos = rows.filter(r => {
-      const status = r.get('Status');
-      return status && status.trim().toLowerCase() === 'resolvido';
-    }).length;
-
-    // Resposta em JSON
-    res.json({
-      total: total,
-      resolvidos: resolvidos,
-      bairros: bairrosUnicos || (total > 0 ? 1 : 0)
-    });
-
+    res.json({ total, resolvidos, bairros: bairrosUnicos || (total > 0 ? 1 : 0) });
   } catch (error) {
-    console.error("Erro na rota de estatísticas:", error);
-    res.status(500).json({ erro: "Falha ao processar dados da planilha" });
+    res.status(500).json({ erro: "Erro ao calcular estatísticas" });
   }
 });
 
-// ------- Buscar todos os pontos para o mapa ---------
+// ------- 3. Pontos para o Mapa ---------
 app.get('/api/pontos-mapa', async (req, res) => {
   try {
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
     const rows = await sheet.getRows();
 
-    // Mapeia as linhas para o formato que o Leaflet entende
+    const pontos = rows.map(r => {
+        const latRaw = r.get('Latitude');
+        const lngRaw = r.get('Longitude');
+        if(!latRaw || !lngRaw) return null;
 
-const pontos = rows.map(r => {
-  // Pega o valor da planilha (Latitude e Longitude)
-  let latRaw = r.get('Latitude') || "";
-  let lngRaw = r.get('Longitude') || "";
+        return {
+            lat: parseFloat(String(latRaw).replace(',', '.')),
+            lng: parseFloat(String(lngRaw).replace(',', '.')),
+            categoria: r.get('Categoria'),
+            status: r.get('Status') || 'Pendente',
+            bairro: r.get('Bairro'),
+            rua: r.get('Rua'),
+            apoios: r.get('Apoios')
+        };
+    }).filter(p => p !== null);
 
-  // FORÇA A CONVERSÃO: Transforma vírgula em ponto e remove espaços
-  const latLimpa = String(latRaw).replace(',', '.').trim();
-  const lngLimpa = String(lngRaw).replace(',', '.').trim();
-
-  // CONVERTE PARA NÚMERO REAL
-  const lat = parseFloat(latLimpa);
-  const lng = parseFloat(lngLimpa);
-
-  return {
-    lat: lat,
-    lng: lng,
-    categoria: r.get('Categoria'),
-    status: r.get('Status') || 'Pendente'
-  };
-}).filter(p => !isNaN(p.lat) && !isNaN(p.lng)); // Só envia pro mapa se for um número válido
-
-res.json(pontos);
-  } catch (error) {
-    res.status(500).json({ erro: "Erro ao carregar pontos do mapa" });
+    res.json(pontos);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Erro ao carregar mapa");
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`📡 Servidor Voz Urbana rodando na porta ${PORT}`));
