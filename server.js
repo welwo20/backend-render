@@ -6,174 +6,209 @@ const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 
 const app = express();
-
-//cors para permitir o HTML (porta 5500 ou live server) 
-// acessar o Node (porta 3000) sem ser bloqueado pelo navegador.
 app.use(cors()); 
 app.use(express.json());
 
-// Configuração de Autenticação do Google
 const auth = new JWT({
   email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-  key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'), // Corrige as quebras de linha
+  key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
   scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 });
 
 const doc = new GoogleSpreadsheet(process.env.GOOGLE_SHEET_ID, auth);
 
-//--------------BUSCAR DADOS----------------
-app.get('/api/incidentes', async (req, res) => {
+const CIDADE_PERMITIDA = "PORCIUNCULA";
+
+function normalizarTexto(texto) {
+  return String(texto || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase()
+    .trim();
+}
+
+function extrairCidade(address = {}) {
+  return (
+    address.city ||
+    address.town ||
+    address.village ||
+    address.municipality ||
+    address.county ||
+    ""
+  );
+}
+
+function enderecoEhDePorciuncula(...partes) {
+  return normalizarTexto(partes.filter(Boolean).join(" ")).includes(CIDADE_PERMITIDA);
+}
+
+function montarEnderecoConfirmado(dados = {}) {
+  const address = dados.address || {};
+  const cidade = extrairCidade(address);
+  const bairro =
+    address.suburb ||
+    address.neighbourhood ||
+    address.city_district ||
+    address.quarter ||
+    "Centro/Geral";
+  const logradouro =
+    address.road ||
+    address.pedestrian ||
+    address.footway ||
+    address.cycleway ||
+    "Logradouro não identificado";
+
+  return {
+    cidade,
+    bairro,
+    logradouro,
+    endereco: dados.display_name || "",
+    permitido: enderecoEhDePorciuncula(cidade, dados.display_name)
+  };
+}
+
+// ==========================================
+// ROTA PARA CONFIRMAR ENDEREÇO POR COORDENADAS
+// ==========================================
+app.post('/api/confirmar-endereco', async (req, res) => {
+  const { lat, lng } = req.body;
+
+  if (!lat || !lng) {
+    return res.status(400).json({ erro: "Latitude e longitude são obrigatórias." });
+  }
+
   try {
-    await doc.loadInfo();
-    const sheet = doc.sheetsByIndex[0];
-    const rows = await sheet.getRows();
-    
-    const incidentes = rows.map(row => ({
-      latitude: parseFloat(row.get('Latitude')),
-      longitude: parseFloat(row.get('Longitude')),
-      categoria: row.get('Categoria'),
-      descricao: row.get('Descricao'),
-      dataHora: row.get('DataHora')
-    }));
-    
-    res.json(incidentes);
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`;
+    const response = await axios.get(url, { headers: { 'User-Agent': 'VozUrbana-App' } });
+
+    res.json(montarEnderecoConfirmado(response.data));
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ erro: "Erro ao buscar dados geográficos." });
+    console.error("Erro ao confirmar endereço:", error.message);
+    res.status(500).json({ erro: "Não foi possível confirmar o endereço." });
   }
 });
 
-
-// Captura GPS -> Converte em Endereço -> Salva na Planilha
+// ==========================================
+// 1. ROTA PARA REGISTRAR/APOIAR INCIDENTES
+// ==========================================
 app.post('/api/incidentes', async (req, res) => {
-  const { lat, lng, categoria, descricao } = req.body;
+  const { lat, lng, categoria, descricao, rua, logradouro, bairro, bairroConfirmado, cidadeConfirmada, modoLocalizacao } = req.body;
+  const userIP = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
 
   try {
-    // Geocodificação Reversa (Transforma coord. em endereço)
-    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`;
-    const response = await axios.get(url, {
-      headers: { 'User-Agent': 'VozUrbana-App' }
-    });
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`;
+    const response = await axios.get(url, { headers: { 'User-Agent': 'VozUrbana-App' } });
+    
+    const addr = response.data && response.data.address ? response.data.address : {};
+    const cidadeDetectada = extrairCidade(addr) || cidadeConfirmada;
 
-    const endereco = response.data.display_name || "Endereço não encontrado";
-    // Tenta pegar o bairro de diferentes campos que o Nominatim pode retornar
-    const bairro = response.data.address.suburb || 
-                   response.data.address.neighbourhood || 
-                   response.data.address.city_district || 
-                   "Centro/Geral";
+    if (!enderecoEhDePorciuncula(cidadeDetectada, cidadeConfirmada, response.data.display_name)) {
+      return res.status(403).json({ erro: "Relatos permitidos apenas em Porciúncula-RJ." });
+    }
+    
+    // Prioriza o que o GPS achou, senão usa o que o frontend enviou
+    const finalRua = addr.road || rua || logradouro || "Rua não identificada";
+    const finalBairro = addr.suburb || addr.neighbourhood || bairro || bairroConfirmado || "Centro";
+    const cidade = "Porciúncula-RJ";
 
-    // Preparação para a Planilha
+    const idAgrupador = `${categoria}_${finalRua}_${finalBairro}`.toLowerCase().replace(/\s+/g, '-');
+
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
+    const rows = await sheet.getRows();
 
-    // FORÇA O FUSO HORÁRIO DE BRASÍLIA
-const dataHoraBr = new Date().toLocaleString("pt-BR", {
-  timeZone: "America/Sao_Paulo"
-});
+    // Verifica se este IP já interagiu com este ID específico
+    const jaVotou = rows.find(r => 
+      r.get('ID_Agrupador') === idAgrupador && 
+      String(r.get('IPs_Apoiadores') || "").includes(userIP)
+    );
 
-    // Salvamento Único
+    if (jaVotou) return res.status(409).json({ erro: "Você já relatou ou apoiou este problema aqui." });
+
+    const incidenteAtivo = rows.find(r => 
+      r.get('ID_Agrupador') === idAgrupador && r.get('Status') !== 'Resolvido'
+    );
+
+    if (incidenteAtivo) {
+      incidenteAtivo.set('Apoios', parseInt(incidenteAtivo.get('Apoios') || 1) + 1);
+      const ips = incidenteAtivo.get('IPs_Apoiadores') || "";
+      incidenteAtivo.set('IPs_Apoiadores', ips ? `${ips}, ${userIP}` : userIP);
+      await incidenteAtivo.save();
+      return res.status(200).json({ sucesso: true, mensagem: "Apoio registrado!", bairro: finalBairro });
+    }
+
     await sheet.addRow({
-      DataHora: dataHoraBr.toLocaleString('pt-BR'),
+      DataHora: new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" }),
+      ID_Agrupador: idAgrupador,
       Categoria: categoria,
       Descricao: descricao || "",
-      // Converte para vírgula apenas no salvamento para a planilha aceitar
+      Rua: finalRua,
+      Logradouro: finalRua,
+      Bairro: finalBairro,
+      Cidade: cidade,
+      Endereco: response.data.display_name || "Endereço manual",
+      Apoios: 1,
+      Status: 'Pendente',
+      IPs_Apoiadores: userIP,
       Latitude: String(lat).replace('.', ','),
-      Longitude: String(lng).replace('.', ','),
-      Endereco: endereco,
-      Bairro: bairro,
-      Status: 'Pendente'
+      Longitude: String(lng).replace('.', ',')
     });
 
-    console.log(`✅ Relato salvo: ${categoria} em ${bairro}`);
-    
-    // Retorna o bairro para o frontend mostrar no alerta
-    res.status(201).json({ 
-      sucesso: true, 
-      mensagem: "Incidente reportado com sucesso!",
-      bairro: bairro 
-    });
+    res.status(201).json({ sucesso: true, mensagem: "Relato enviado!", bairro: finalBairro });
 
   } catch (error) {
-    console.error("❌ Erro no processo de reporte:", error.message);
-    res.status(500).json({ erro: "Falha ao gravar os dados georeferenciados." });
+    console.error("❌ Erro no Servidor:", error.message);
+    res.status(500).json({ erro: "Falha ao processar reporte georeferenciado." });
   }
 });
 
-//---------- Estatísticas para os cards do frontend---------
+//---------- 2. Estatísticas ---------
 app.get('/api/estatisticas', async (req, res) => {
   try {
-    // Carrega os dados da planilha
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
     const rows = await sheet.getRows();
 
-    // Cálculo dos Problemas Reportados (Total de linhas)
     const total = rows.length;
+    const resolvidos = rows.filter(r => String(r.get('Status')).toLowerCase() === 'resolvido').length;
     
-    // Cálculo de Bairros Ativos (Coluna 'Endereco')
-    const bairrosUnicos = new Set(rows.map(r => {
-      const endereco = r.get('Endereco');
-      if (endereco && endereco.includes(',')) {
-        return endereco.split(',')[1].trim(); // Pega a parte após a vírgula (Bairro)
-      }
-      return null;
-    }).filter(b => b !== null)).size;
+    const bairrosUnicos = new Set(rows.map(r => r.get('Bairro')).filter(b => b)).size;
 
-   const resolvidos = rows.filter(r => {
-      const status = r.get('Status');
-      return status && status.trim().toLowerCase() === 'resolvido';
-    }).length;
-
-    // Resposta em JSON
-    res.json({
-      total: total,
-      resolvidos: resolvidos,
-      bairros: bairrosUnicos || (total > 0 ? 1 : 0)
-    });
-
+    res.json({ total, resolvidos, bairros: bairrosUnicos || (total > 0 ? 1 : 0) });
   } catch (error) {
-    console.error("Erro na rota de estatísticas:", error);
-    res.status(500).json({ erro: "Falha ao processar dados da planilha" });
+    res.status(500).json({ erro: "Erro ao calcular estatísticas" });
   }
 });
 
-// ------- Buscar todos os pontos para o mapa ---------
+// ------- 3. Pontos para o Mapa ---------
 app.get('/api/pontos-mapa', async (req, res) => {
   try {
     await doc.loadInfo();
     const sheet = doc.sheetsByIndex[0];
     const rows = await sheet.getRows();
 
-    // Mapeia as linhas para o formato que o Leaflet entende
+    const pontos = rows.map(r => {
+        const latRaw = r.get('Latitude');
+        const lngRaw = r.get('Longitude');
+        if(!latRaw || !lngRaw) return null;
 
-const pontos = rows.map(r => {
-  // Pega o valor da planilha (Latitude e Longitude)
-  let latRaw = r.get('Latitude') || "";
-  let lngRaw = r.get('Longitude') || "";
+        return {
+            lat: parseFloat(String(latRaw).replace(',', '.')),
+            lng: parseFloat(String(lngRaw).replace(',', '.')),
+            categoria: r.get('Categoria'),
+            status: r.get('Status') || 'Pendente',
+            bairro: r.get('Bairro'),
+            rua: r.get('Rua'),
+            apoios: r.get('Apoios')
+        };
+    }).filter(p => p !== null);
 
-  // FORÇA A CONVERSÃO: Transforma vírgula em ponto e remove espaços
-  const latLimpa = String(latRaw).replace(',', '.').trim();
-  const lngLimpa = String(lngRaw).replace(',', '.').trim();
-
-  // CONVERTE PARA NÚMERO REAL
-  const lat = parseFloat(latLimpa);
-  const lng = parseFloat(lngLimpa);
-
-  return {
-    lat: lat,
-    lng: lng,
-    categoria: r.get('Categoria'),
-    status: r.get('Status') || 'Pendente'
-  };
-}).filter(p => !isNaN(p.lat) && !isNaN(p.lng)); // Só envia pro mapa se for um número válido
-
-res.json(pontos);
-  } catch (error) {
-    res.status(500).json({ erro: "Erro ao carregar pontos do mapa" });
+    res.json(pontos);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Erro ao carregar mapa");
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`📡 Servidor Voz Urbana rodando na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`📡 Servidor Voz Urbana rodando na porta ${PORT}`));
